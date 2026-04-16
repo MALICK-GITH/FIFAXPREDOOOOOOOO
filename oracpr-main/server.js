@@ -1837,6 +1837,43 @@ app.get("/api/structure", async (_req, res) => {
   }
 });
 
+app.get("/api/db/status", async (_req, res) => {
+  try {
+    const status = await getDbStatus();
+    res.json({
+      success: true,
+      data: status,
+      meta: {
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: "DB_STATUS_ERROR",
+        message: "Impossible de verifier le statut de la base de donnees.",
+        details: error.message
+      }
+    });
+  }
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json({
+    success: true,
+    data: {
+      status: "healthy",
+      service: "FIFAXPREDOOOOOOOO Backend",
+      version: "1.0.0",
+      uptime: process.uptime()
+    },
+    meta: {
+      timestamp: new Date().toISOString()
+    }
+  });
+});
+
 app.get("/api/matches", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
