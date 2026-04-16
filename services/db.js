@@ -65,6 +65,16 @@ sqliteDb.exec(`
   );
 `);
 
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS favorites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    user_id TEXT,
+    coupon_id TEXT,
+    coupon_json TEXT
+  );
+`);
+
 const sqliteInsertCouponGenerationStmt = sqliteDb.prepare(`
   INSERT INTO coupon_generations (size, league, risk, source, summary_json, coupon_json)
   VALUES (?, ?, ?, ?, ?, ?)
@@ -83,6 +93,19 @@ const sqliteInsertTelegramLogStmt = sqliteDb.prepare(`
 const sqliteInsertAuditReportStmt = sqliteDb.prepare(`
   INSERT INTO audit_reports (audit_id, action, payload_json, result_json)
   VALUES (?, ?, ?, ?)
+`);
+
+const sqliteInsertFavoriteStmt = sqliteDb.prepare(`
+  INSERT INTO favorites (user_id, coupon_id, coupon_json)
+  VALUES (?, ?, ?)
+`);
+
+const sqliteSelectFavoritesStmt = sqliteDb.prepare(`
+  SELECT id, created_at, user_id, coupon_id, coupon_json
+  FROM favorites
+  WHERE user_id = ?
+  ORDER BY id DESC
+  LIMIT ?
 `);
 
 const sqliteSelectCouponHistoryStmt = sqliteDb.prepare(`
@@ -221,6 +244,16 @@ async function initMySql() {
           saved_options_json LONGTEXT NULL,
           payload_json LONGTEXT NULL,
           result_json LONGTEXT NULL
+        )
+      `);
+
+      await mysqlPool.query(`
+        CREATE TABLE IF NOT EXISTS favorites (
+          id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          user_id VARCHAR(255) NULL,
+          coupon_id VARCHAR(255) NOT NULL,
+          coupon_json LONGTEXT NULL
         )
       `);
 
@@ -431,6 +464,66 @@ async function getTelegramHistory(limit = 20) {
   }));
 }
 
+async function saveFavorite(entry = {}) {
+  const userId = entry.userId ? String(entry.userId) : "anonymous";
+  const couponId = entry.couponId ? String(entry.couponId) : null;
+
+  if (!couponId) {
+    throw new Error("coupon_id requis");
+  }
+
+  if (await canUseMySql()) {
+    const [result] = await mysqlPool.execute(
+      `INSERT INTO favorites (user_id, coupon_id, coupon_json)
+       VALUES (?, ?, ?)`,
+      [
+        userId,
+        couponId,
+        toJson(entry.coupon || {}, {})
+      ]
+    );
+    return result.insertId;
+  }
+
+  const result = sqliteInsertFavoriteStmt.run(
+    userId,
+    couponId,
+    toJson(entry.coupon || {}, {})
+  );
+  return result.lastInsertRowid;
+}
+
+async function getFavorites(userId = "anonymous", limit = 20) {
+  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 20));
+  const safeUserId = String(userId);
+
+  if (await canUseMySql()) {
+    const [rows] = await mysqlPool.execute(
+      `SELECT id, created_at, user_id, coupon_id, coupon_json
+       FROM favorites
+       WHERE user_id = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+      [safeUserId, safeLimit]
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      createdAt: normalizeDate(row.created_at),
+      userId: row.user_id,
+      couponId: row.coupon_id,
+      coupon: parseJsonSafe(row.coupon_json, {}),
+    }));
+  }
+
+  return sqliteSelectFavoritesStmt.all(safeUserId, safeLimit).map((row) => ({
+    id: row.id,
+    createdAt: row.created_at,
+    userId: row.user_id,
+    couponId: row.coupon_id,
+    coupon: parseJsonSafe(row.coupon_json, {}),
+  }));
+}
+
 async function getAuditHistory(limit = 20) {
   const safeLimit = Math.max(1, Math.min(200, Number(limit) || 20));
 
@@ -513,4 +606,6 @@ module.exports = {
   getTelegramHistory,
   getAuditHistory,
   getDbStatus,
+  saveFavorite,
+  getFavorites,
 };

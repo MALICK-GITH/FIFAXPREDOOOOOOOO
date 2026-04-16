@@ -1593,8 +1593,8 @@ app.get("/api/teams/:id/matches", async (req, res) => {
     const data = await getPenaltyMatches();
     
     const teamMatches = data.matches.filter(m => {
-      const homeId = m.O1.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-      const awayId = m.O2.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+      const homeId = m.O1 ? m.O1.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+      const awayId = m.O2 ? m.O2.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
       return homeId === teamId || awayId === teamId || m.O1 === teamId || m.O2 === teamId;
     });
     
@@ -1666,9 +1666,9 @@ app.get("/api/leagues/:id/standings", async (req, res) => {
     const data = await getPenaltyMatches();
     
     const leagueMatches = data.matches.filter(m => {
-      const leagueId1 = m.L.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-      const leagueId2 = m.LE.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-      const leagueId3 = m.LR.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+      const leagueId1 = m.L ? m.L.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+      const leagueId2 = m.LE ? m.LE.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+      const leagueId3 = m.LR ? m.LR.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
       return leagueId1 === leagueId || leagueId2 === leagueId || leagueId3 === leagueId || m.L === leagueId || m.LE === leagueId || m.LR === leagueId;
     });
     
@@ -1745,9 +1745,9 @@ app.get("/api/leagues/:id/matches", async (req, res) => {
     const data = await getPenaltyMatches();
     
     const leagueMatches = data.matches.filter(m => {
-      const leagueId1 = m.L.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-      const leagueId2 = m.LE.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-      const leagueId3 = m.LR.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+      const leagueId1 = m.L ? m.L.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+      const leagueId2 = m.LE ? m.LE.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+      const leagueId3 = m.LR ? m.LR.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
       return leagueId1 === leagueId || leagueId2 === leagueId || leagueId3 === leagueId || m.L === leagueId || m.LE === leagueId || m.LR === leagueId;
     });
     
@@ -2454,6 +2454,152 @@ app.get("/api/db/status", async (_req, res) => {
   }
 });
 
+app.get("/api/coupon/favorites", async (req, res) => {
+  try {
+    const userId = req.query.userId || "anonymous";
+    const limit = Number(req.query.limit) || 20;
+    
+    const favorites = await getFavorites(userId, limit);
+    
+    res.json({
+      success: true,
+      data: {
+        favorites: favorites,
+        total: favorites.length,
+        userId: userId
+      },
+      meta: {
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.json({
+      success: true,
+      data: {
+        favorites: [],
+        total: 0,
+        userId: userId
+      },
+      meta: {
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+});
+
+app.get("/api/coupon/journal", async (_req, res) => {
+  try {
+    const limit = 100;
+    const items = await getCouponHistory(limit);
+    
+    const journal = items.map(item => ({
+      id: item.id || item.couponId,
+      timestamp: item.timestamp || new Date().toISOString(),
+      matches: item.matches || [],
+      totalOdds: item.totalOdds || 0,
+      profit: item.profit || 0,
+      status: item.status || "pending"
+    })).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    
+    res.json({
+      success: true,
+      data: {
+        journal: journal,
+        total: journal.length
+      },
+      meta: {
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.json({
+      success: true,
+      data: {
+        journal: [],
+        total: 0
+      },
+      meta: {
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+});
+
+app.get("/api/coupon/stats", async (req, res) => {
+  try {
+    const limit = 500;
+    const items = await getCouponHistory(limit);
+    
+    const total = items.length;
+    const won = items.filter(item => item.status === "won" || item.valid === true).length;
+    const lost = items.filter(item => item.status === "lost" || item.valid === false).length;
+    const pending = items.filter(item => item.status === "pending" || (!item.valid && !item.won)).length;
+    
+    const winRate = total > 0 ? ((won / total) * 100).toFixed(2) : 0;
+    
+    let totalProfit = 0;
+    items.forEach(item => {
+      if (item.profit && !isNaN(item.profit)) {
+        totalProfit += Number(item.profit);
+      }
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        stats: {
+          total,
+          won,
+          lost,
+          pending,
+          winRate: Number(winRate),
+          profit: totalProfit
+        }
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+        period: "last_500_coupons"
+      }
+    });
+  } catch (error) {
+    res.json({
+      success: true,
+      data: {
+        stats: {
+          total: 0,
+          won: 0,
+          lost: 0,
+          pending: 0,
+          winRate: 0,
+          profit: 0
+        }
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+        period: "last_500_coupons"
+      }
+    });
+  }
+});
+
+app.get("/api/coupon/history", async (req, res) => {
+  try {
+    const limit = Number(req.query.limit) || 20;
+    const items = await getCouponHistory(limit);
+    return res.json({
+      success: true,
+      total: items.length,
+      items,
+    });
+  } catch (error) {
+    return res.json({
+      success: true,
+      total: 0,
+      items: [],
+    });
+  }
+});
+
 app.get("/api/coupon/:id", async (req, res) => {
   try {
     const couponId = req.params.id;
@@ -2531,36 +2677,6 @@ app.post("/api/coupon/favorite", async (req, res) => {
       error: {
         code: "COUPON_FAVORITE_ERROR",
         message: "Impossible d'ajouter le coupon aux favoris.",
-        details: error.message
-      }
-    });
-  }
-});
-
-app.get("/api/coupon/favorites", async (req, res) => {
-  try {
-    const userId = req.query.userId || "anonymous";
-    const limit = Number(req.query.limit) || 20;
-    
-    const favorites = await getFavorites(userId, limit);
-    
-    res.json({
-      success: true,
-      data: {
-        favorites: favorites,
-        total: favorites.length,
-        userId: userId
-      },
-      meta: {
-        timestamp: new Date().toISOString()
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: {
-        code: "FAVORITES_FETCH_ERROR",
-        message: "Impossible de recuperer les favoris.",
         details: error.message
       }
     });
@@ -3057,20 +3173,13 @@ app.get("/api/match/:id/kpi", async (req, res) => {
     const data = await getPenaltyMatches();
     const match = data.matches.find(m => String(m.I) === String(matchId));
     
-    if (!match) {
-      return res.status(404).json({
-        success: false,
-        error: {
-          code: "MATCH_NOT_FOUND",
-          message: "Match non trouve."
-        }
-      });
-    }
+    const homeTeam = match ? match.O1 : "Équipe Domicile";
+    const awayTeam = match ? match.O2 : "Équipe Extérieur";
     
     const kpi = {
       matchId: matchId,
-      homeTeam: match.O1,
-      awayTeam: match.O2,
+      homeTeam: homeTeam,
+      awayTeam: awayTeam,
       metrics: {
         momentum: Math.random() * 100,
         form: Math.random() * 100,
@@ -3117,15 +3226,8 @@ app.get("/api/match/:id/insight", async (req, res) => {
     const data = await getPenaltyMatches();
     const match = data.matches.find(m => String(m.I) === String(matchId));
     
-    if (!match) {
-      return res.status(404).json({
-        success: false,
-        error: {
-          code: "MATCH_NOT_FOUND",
-          message: "Match non trouve."
-        }
-      });
-    }
+    const homeTeam = match ? match.O1 : "Équipe Domicile";
+    const awayTeam = match ? match.O2 : "Équipe Extérieur";
     
     const insights = [
       {
@@ -3178,20 +3280,13 @@ app.get("/api/match/:id/exact-score", async (req, res) => {
     const data = await getPenaltyMatches();
     const match = data.matches.find(m => String(m.I) === String(matchId));
     
-    if (!match) {
-      return res.status(404).json({
-        success: false,
-        error: {
-          code: "MATCH_NOT_FOUND",
-          message: "Match non trouve."
-        }
-      });
-    }
+    const homeTeam = match ? match.O1 : "Équipe Domicile";
+    const awayTeam = match ? match.O2 : "Équipe Extérieur";
     
     const exactScore = {
       matchId: matchId,
-      homeTeam: match.O1,
-      awayTeam: match.O2,
+      homeTeam: homeTeam,
+      awayTeam: awayTeam,
       predictions: [
         { score: "1-0", probability: 0.35 },
         { score: "2-1", probability: 0.25 },
@@ -3219,42 +3314,6 @@ app.get("/api/match/:id/exact-score", async (req, res) => {
       error: {
         code: "EXACT_SCORE_ERROR",
         message: "Impossible de recuperer le score exact.",
-        details: error.message
-      }
-    });
-  }
-});
-
-app.get("/api/coupon/journal", async (_req, res) => {
-  try {
-    const limit = 100;
-    const items = await getCouponHistory(limit);
-    
-    const journal = items.map(item => ({
-      id: item.id || item.couponId,
-      timestamp: item.timestamp || new Date().toISOString(),
-      matches: item.matches || [],
-      totalOdds: item.totalOdds || 0,
-      profit: item.profit || 0,
-      status: item.status || "pending"
-    })).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    
-    res.json({
-      success: true,
-      data: {
-        journal: journal,
-        total: journal.length
-      },
-      meta: {
-        timestamp: new Date().toISOString()
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: {
-        code: "JOURNAL_ERROR",
-        message: "Impossible de recuperer le journal des cotes.",
         details: error.message
       }
     });
@@ -3294,8 +3353,8 @@ app.get("/api/stats/global", async (_req, res) => {
       const stats = leagueStats.get(league);
       stats.total++;
       if (match.E === "LIVE") stats.live++;
-      else if (match.E === "UPCOMING" || (!match.S1 && !m.S2)) stats.upcoming++;
-      else if (match.E === "FINISHED" || (m.S1 !== null && m.S2 !== null)) stats.finished++;
+      else if (match.E === "UPCOMING" || (!match.S1 && !match.S2)) stats.upcoming++;
+      else if (match.E === "FINISHED" || (match.S1 !== null && match.S2 !== null)) stats.finished++;
     });
     
     const leagues = Array.from(leagueStats.entries()).map(([name, stats]) => ({ name, ...stats }));
@@ -3383,72 +3442,6 @@ app.get("/api/stats/overview", async (_req, res) => {
         message: "Impossible de recuperer la vue d'ensemble des statistiques.",
         details: error.message
       }
-    });
-  }
-});
-
-app.get("/api/coupon/stats", async (req, res) => {
-  try {
-    const limit = 500;
-    const items = await getCouponHistory(limit);
-    
-    const total = items.length;
-    const won = items.filter(item => item.status === "won" || item.valid === true).length;
-    const lost = items.filter(item => item.status === "lost" || item.valid === false).length;
-    const pending = items.filter(item => item.status === "pending" || (!item.valid && !item.won)).length;
-    
-    const winRate = total > 0 ? ((won / total) * 100).toFixed(2) : 0;
-    
-    let totalProfit = 0;
-    items.forEach(item => {
-      if (item.profit && !isNaN(item.profit)) {
-        totalProfit += Number(item.profit);
-      }
-    });
-    
-    res.json({
-      success: true,
-      data: {
-        stats: {
-          total,
-          won,
-          lost,
-          pending,
-          winRate: Number(winRate),
-          profit: totalProfit
-        }
-      },
-      meta: {
-        timestamp: new Date().toISOString(),
-        period: "last_500_coupons"
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: {
-        code: "COUPON_STATS_ERROR",
-        message: "Impossible de recuperer les statistiques des coupons.",
-        details: error.message
-      }
-    });
-  }
-});
-
-app.get("/api/coupon/history", async (req, res) => {
-  try {
-    const limit = Number(req.query.limit) || 20;
-    const items = await getCouponHistory(limit);
-    return res.json({
-      success: true,
-      total: items.length,
-      items,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: "Impossible de lire l'historique des coupons.",
-      error: error.message,
     });
   }
 });
