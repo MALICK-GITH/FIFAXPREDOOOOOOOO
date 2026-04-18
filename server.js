@@ -125,6 +125,162 @@ function normalizeTeamKey(name = "") {
     .trim();
 }
 
+function normalizeLookupText(value = "") {
+  return String(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function slugifyLookup(value = "") {
+  return normalizeLookupText(value).replace(/\s+/g, "-");
+}
+
+function getMatchId(match = {}) {
+  return String(match?.id || "");
+}
+
+function getMatchTeams(match = {}) {
+  return {
+    home: String(match?.teamHome || "").trim(),
+    away: String(match?.teamAway || "").trim(),
+  };
+}
+
+function getMatchLeague(match = {}) {
+  return String(match?.league || "").trim() || "Unknown";
+}
+
+function getMatchScore(match = {}) {
+  const context = normalizePlainObject(match?.context);
+  const score = normalizePlainObject(match?.score);
+  const home = Number(context.score1 ?? score.S1 ?? score.SA ?? score.H ?? score.Home);
+  const away = Number(context.score2 ?? score.S2 ?? score.SB ?? score.A ?? score.Away);
+  return {
+    home: Number.isFinite(home) ? home : 0,
+    away: Number.isFinite(away) ? away : 0,
+  };
+}
+
+function getMatchMinute(match = {}) {
+  const context = normalizePlainObject(match?.context);
+  const minute = Number(context.minute);
+  return Number.isFinite(minute) ? minute : 0;
+}
+
+function getMatchOdds(match = {}) {
+  const home = Number(match?.odds1x2?.home);
+  const draw = Number(match?.odds1x2?.draw);
+  const away = Number(match?.odds1x2?.away);
+  return {
+    home: Number.isFinite(home) && home > 1 ? home : null,
+    draw: Number.isFinite(draw) && draw > 1 ? draw : null,
+    away: Number.isFinite(away) && away > 1 ? away : null,
+  };
+}
+
+function getMatchPrimaryOdd(match = {}) {
+  const odds = getMatchOdds(match);
+  return odds.home || odds.draw || odds.away || null;
+}
+
+function getMatchAverageOdd(match = {}) {
+  const values = Object.values(getMatchOdds(match)).filter((value) => Number.isFinite(value));
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function classifyMatchStatus(match = {}) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const start = Number(match?.startTimeUnix || 0);
+  const statusCode = Number(match?.statusCode || 0);
+  const info = normalizeLookupText(match?.infoText || "");
+  const status = normalizeLookupText(match?.statusText || "");
+  const phase = normalizeLookupText(match?.phase || "");
+  const minute = getMatchMinute(match);
+
+  const isFinishedByText =
+    status.includes("termine") ||
+    phase.includes("termine") ||
+    info.includes("termine") ||
+    statusCode === 3;
+
+  const isUpcomingBySignal =
+    statusCode === 128 ||
+    info.includes("avant le debut") ||
+    status.includes("debut dans");
+
+  const isLiveByText =
+    phase.includes("mi temps") ||
+    status.includes("minute") ||
+    status.includes("mi temps") ||
+    info.includes("1ere mi temps") ||
+    info.includes("2eme mi temps") ||
+    minute > 0;
+
+  if (isFinishedByText) return "finished";
+  if (isUpcomingBySignal || start > nowSec) return "upcoming";
+  if (isLiveByText) return "live";
+  return "live";
+}
+
+function getMatchStatusLabel(match = {}) {
+  return String(match?.statusText || "").trim() || classifyMatchStatus(match);
+}
+
+function matchMatchesTeam(match = {}, teamIdentifier = "") {
+  const targetText = normalizeLookupText(teamIdentifier);
+  const targetSlug = slugifyLookup(teamIdentifier);
+  if (!targetText && !targetSlug) return false;
+  return [getMatchTeams(match).home, getMatchTeams(match).away].some((name) => {
+    const normalized = normalizeLookupText(name);
+    return normalized === targetText || slugifyLookup(name) === targetSlug;
+  });
+}
+
+function matchMatchesLeague(match = {}, leagueIdentifier = "") {
+  const leagueName = getMatchLeague(match);
+  const targetText = normalizeLookupText(leagueIdentifier);
+  const targetSlug = slugifyLookup(leagueIdentifier);
+  if (!targetText && !targetSlug) return false;
+  return normalizeLookupText(leagueName) === targetText || slugifyLookup(leagueName) === targetSlug;
+}
+
+function getMatchSearchText(match = {}) {
+  const teams = getMatchTeams(match);
+  return normalizeLookupText([teams.home, teams.away, getMatchLeague(match), getMatchStatusLabel(match)].join(" "));
+}
+
+function buildMatchSummary(match = {}, extra = {}) {
+  const teams = getMatchTeams(match);
+  return {
+    matchId: getMatchId(match),
+    homeTeam: teams.home,
+    awayTeam: teams.away,
+    league: getMatchLeague(match),
+    status: getMatchStatusLabel(match),
+    startTime: Number(match?.startTimeUnix) || null,
+    odds: getMatchPrimaryOdd(match),
+    ...extra,
+  };
+}
+
+function summarizeMatchBuckets(matches = []) {
+  return matches.reduce(
+    (summary, match) => {
+      summary.total += 1;
+      const bucket = classifyMatchStatus(match);
+      if (bucket === "live") summary.live += 1;
+      else if (bucket === "finished") summary.finished += 1;
+      else summary.upcoming += 1;
+      return summary;
+    },
+    { total: 0, live: 0, upcoming: 0, finished: 0 }
+  );
+}
+
 const TEAM_COLOR_MAP = new Map([
   ["manchester city", ["#6CABDD", "#1C2C5B"]],
   ["borussia dortmund", ["#FDE100", "#111111"]],
@@ -1702,25 +1858,21 @@ app.get("/api/teams/:id/matches", async (req, res) => {
   try {
     const teamId = req.params.id;
     const data = await getPenaltyMatches();
-    
-    const teamMatches = data.matches.filter(m => {
-      const homeId = m.O1 ? m.O1.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      const awayId = m.O2 ? m.O2.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      return homeId === teamId || awayId === teamId || m.O1 === teamId || m.O2 === teamId;
-    });
-    
+
+    const teamMatches = data.matches.filter((match) => matchMatchesTeam(match, teamId));
+
     res.json({
       success: true,
       data: {
         matches: teamMatches,
         total: teamMatches.length,
-        teamId: teamId
+        teamId,
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -1728,8 +1880,8 @@ app.get("/api/teams/:id/matches", async (req, res) => {
       error: {
         code: "TEAM_MATCHES_ERROR",
         message: "Impossible de recuperer les matchs de l'equipe.",
-        details: error.message
-      }
+        details: error.message,
+      },
     });
   }
 });
@@ -1738,26 +1890,29 @@ app.get("/api/teams", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
     const teamSet = new Set();
-    
-    data.matches.forEach(match => {
-      if (match.O1) teamSet.add(match.O1);
-      if (match.O2) teamSet.add(match.O2);
+
+    data.matches.forEach((match) => {
+      const teams = getMatchTeams(match);
+      if (teams.home) teamSet.add(teams.home);
+      if (teams.away) teamSet.add(teams.away);
     });
-    
-    const teams = Array.from(teamSet).map(name => ({
-      name: name,
-      id: name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
-    })).sort((a, b) => a.name.localeCompare(b.name));
-    
+
+    const teams = Array.from(teamSet)
+      .map((name) => ({
+        name,
+        id: slugifyLookup(name),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
     res.json({
       success: true,
       data: {
-        teams: teams,
-        total: teams.length
+        teams,
+        total: teams.length,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -1765,8 +1920,8 @@ app.get("/api/teams", async (_req, res) => {
       error: {
         code: "TEAMS_FETCH_ERROR",
         message: "Impossible de recuperer la liste des equipes.",
-        details: error.message
-      }
+        details: error.message,
+      },
     });
   }
 });
@@ -1775,22 +1930,20 @@ app.get("/api/leagues/:id/standings", async (req, res) => {
   try {
     const leagueId = req.params.id;
     const data = await getPenaltyMatches();
-    
-    const leagueMatches = data.matches.filter(m => {
-      const leagueId1 = m.L ? m.L.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      const leagueId2 = m.LE ? m.LE.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      const leagueId3 = m.LR ? m.LR.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      return leagueId1 === leagueId || leagueId2 === leagueId || leagueId3 === leagueId || m.L === leagueId || m.LE === leagueId || m.LR === leagueId;
-    });
-    
+
+    const leagueMatches = data.matches.filter((match) => matchMatchesLeague(match, leagueId));
+    const completedMatches = leagueMatches.filter((match) => classifyMatchStatus(match) === "finished");
     const teamStats = new Map();
-    
-    leagueMatches.forEach(match => {
-      const homeTeam = match.O1;
-      const awayTeam = match.O2;
-      const homeScore = match.S1 || 0;
-      const awayScore = match.S2 || 0;
-      
+
+    completedMatches.forEach((match) => {
+      const teams = getMatchTeams(match);
+      const homeTeam = teams.home;
+      const awayTeam = teams.away;
+      const score = getMatchScore(match);
+      const homeScore = score.home;
+      const awayScore = score.away;
+
+      if (!homeTeam || !awayTeam) return;
       if (!teamStats.has(homeTeam)) {
         teamStats.set(homeTeam, { name: homeTeam, played: 0, won: 0, drawn: 0, lost: 0, goalsFor: 0, goalsAgainst: 0, points: 0 });
       }
@@ -1824,19 +1977,21 @@ app.get("/api/leagues/:id/standings", async (req, res) => {
         awayStats.points += 1;
       }
     });
-    
-    const standings = Array.from(teamStats.values()).sort((a, b) => b.points - a.points || (b.goalsFor - b.goalsAgainst) - (a.goalsFor - a.goalsAgainst));
-    
+
+    const standings = Array.from(teamStats.values()).sort(
+      (a, b) => b.points - a.points || (b.goalsFor - b.goalsAgainst) - (a.goalsFor - a.goalsAgainst)
+    );
+
     res.json({
       success: true,
       data: {
         standings: standings.map((team, index) => ({ ...team, position: index + 1 })),
         total: standings.length,
-        leagueId: leagueId
+        leagueId,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -1844,8 +1999,8 @@ app.get("/api/leagues/:id/standings", async (req, res) => {
       error: {
         code: "LEAGUE_STANDINGS_ERROR",
         message: "Impossible de recuperer le classement de la ligue.",
-        details: error.message
-      }
+        details: error.message,
+      },
     });
   }
 });
@@ -1854,26 +2009,21 @@ app.get("/api/leagues/:id/matches", async (req, res) => {
   try {
     const leagueId = req.params.id;
     const data = await getPenaltyMatches();
-    
-    const leagueMatches = data.matches.filter(m => {
-      const leagueId1 = m.L ? m.L.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      const leagueId2 = m.LE ? m.LE.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      const leagueId3 = m.LR ? m.LR.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
-      return leagueId1 === leagueId || leagueId2 === leagueId || leagueId3 === leagueId || m.L === leagueId || m.LE === leagueId || m.LR === leagueId;
-    });
-    
+
+    const leagueMatches = data.matches.filter((match) => matchMatchesLeague(match, leagueId));
+
     res.json({
       success: true,
       data: {
         matches: leagueMatches,
         total: leagueMatches.length,
-        leagueId: leagueId
+        leagueId,
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -1881,8 +2031,8 @@ app.get("/api/leagues/:id/matches", async (req, res) => {
       error: {
         code: "LEAGUE_MATCHES_ERROR",
         message: "Impossible de recuperer les matchs de la ligue.",
-        details: error.message
-      }
+        details: error.message,
+      },
     });
   }
 });
@@ -1891,27 +2041,29 @@ app.get("/api/leagues", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
     const leagueSet = new Set();
-    
-    data.matches.forEach(match => {
-      if (match.L) leagueSet.add(match.L);
-      if (match.LE) leagueSet.add(match.LE);
-      if (match.LR) leagueSet.add(match.LR);
+
+    data.matches.forEach((match) => {
+      const league = getMatchLeague(match);
+      if (league) leagueSet.add(league);
     });
-    
-    const leagues = Array.from(leagueSet).filter(Boolean).map(name => ({
-      name: name,
-      id: name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
-    })).sort((a, b) => a.name.localeCompare(b.name));
-    
+
+    const leagues = Array.from(leagueSet)
+      .filter(Boolean)
+      .map((name) => ({
+        name,
+        id: slugifyLookup(name),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
     res.json({
       success: true,
       data: {
-        leagues: leagues,
-        total: leagues.length
+        leagues,
+        total: leagues.length,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2018,18 +2170,18 @@ app.get("/api/matches", async (_req, res) => {
 app.get("/api/matches/live", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
-    const liveMatches = data.matches.filter(m => m.E === "LIVE" || m.E === "live");
+    const liveMatches = data.matches.filter((match) => classifyMatchStatus(match) === "live");
     res.json({
       success: true,
       data: {
         matches: liveMatches,
-        total: liveMatches.length
+        total: liveMatches.length,
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2046,18 +2198,18 @@ app.get("/api/matches/live", async (_req, res) => {
 app.get("/api/matches/upcoming", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
-    const upcomingMatches = data.matches.filter(m => m.E === "UPCOMING" || m.E === "upcoming" || (!m.S1 && !m.S2));
+    const upcomingMatches = data.matches.filter((match) => classifyMatchStatus(match) === "upcoming");
     res.json({
       success: true,
       data: {
         matches: upcomingMatches,
-        total: upcomingMatches.length
+        total: upcomingMatches.length,
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2074,40 +2226,37 @@ app.get("/api/matches/upcoming", async (_req, res) => {
 app.get("/api/matches/search", async (req, res) => {
   try {
     const data = await getPenaltyMatches();
-    const query = req.query.q ? String(req.query.q).toLowerCase() : "";
-    
+    const query = normalizeLookupText(req.query.q || "");
+
     if (!query) {
       return res.json({
         success: true,
         data: {
           matches: data.matches,
-          total: data.matches.length
+          total: data.matches.length,
         },
         meta: {
           source: API_URL,
           fetchedAt: data.fetchedAt,
-          timestamp: new Date().toISOString()
-        }
+          timestamp: new Date().toISOString(),
+        },
       });
     }
-    
-    const searchResults = data.matches.filter(m => {
-      const searchText = `${m.O1} ${m.O2} ${m.L} ${m.LE} ${m.LR}`.toLowerCase();
-      return searchText.includes(query);
-    });
-    
+
+    const searchResults = data.matches.filter((match) => getMatchSearchText(match).includes(query));
+
     res.json({
       success: true,
       data: {
         matches: searchResults,
         total: searchResults.length,
-        query: query
+        query,
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2125,57 +2274,52 @@ app.get("/api/matches/filter", async (req, res) => {
   try {
     const data = await getPenaltyMatches();
     let filteredMatches = data.matches;
-    
+
     const league = req.query.league ? String(req.query.league) : null;
     const team = req.query.team ? String(req.query.team) : null;
     const status = req.query.status ? String(req.query.status) : null;
     const minOdds = req.query.minOdds ? Number(req.query.minOdds) : null;
     const maxOdds = req.query.maxOdds ? Number(req.query.maxOdds) : null;
-    
+
     if (league) {
-      filteredMatches = filteredMatches.filter(m => 
-        m.L === league || m.LE === league || m.LR === league
-      );
+      filteredMatches = filteredMatches.filter((match) => matchMatchesLeague(match, league));
     }
-    
+
     if (team) {
-      filteredMatches = filteredMatches.filter(m => 
-        m.O1 === team || m.O2 === team
-      );
+      filteredMatches = filteredMatches.filter((match) => matchMatchesTeam(match, team));
     }
-    
+
     if (status) {
-      filteredMatches = filteredMatches.filter(m => 
-        m.E === status.toUpperCase() || m.E === status.toLowerCase()
-      );
+      const normalizedStatus = normalizeLookupText(status);
+      filteredMatches = filteredMatches.filter((match) => classifyMatchStatus(match) === normalizedStatus);
     }
-    
-    if (minOdds) {
-      filteredMatches = filteredMatches.filter(m => {
-        const odds = Array.isArray(m.E) ? m.E.find(e => e.G === 1) : null;
-        return odds && Number(odds.O) >= minOdds;
+
+    if (Number.isFinite(minOdds)) {
+      filteredMatches = filteredMatches.filter((match) => {
+        const odd = getMatchPrimaryOdd(match);
+        return Number.isFinite(odd) && odd >= minOdds;
       });
     }
-    
-    if (maxOdds) {
-      filteredMatches = filteredMatches.filter(m => {
-        const odds = Array.isArray(m.E) ? m.E.find(e => e.G === 1) : null;
-        return odds && Number(odds.O) <= maxOdds;
+
+    if (Number.isFinite(maxOdds)) {
+      filteredMatches = filteredMatches.filter((match) => {
+        const odd = getMatchPrimaryOdd(match);
+        return Number.isFinite(odd) && odd <= maxOdds;
       });
     }
-    
+
     res.json({
       success: true,
       data: {
         matches: filteredMatches,
         total: filteredMatches.length,
-        filters: { league, team, status, minOdds, maxOdds }
+        filters: { league, team, status, minOdds, maxOdds },
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2192,18 +2336,18 @@ app.get("/api/matches/filter", async (req, res) => {
 app.get("/api/matches/finished", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
-    const finishedMatches = data.matches.filter(m => m.E === "FINISHED" || m.E === "finished" || (m.S1 !== null && m.S2 !== null && m.E !== "LIVE"));
+    const finishedMatches = data.matches.filter((match) => classifyMatchStatus(match) === "finished");
     res.json({
       success: true,
       data: {
         matches: finishedMatches,
-        total: finishedMatches.length
+        total: finishedMatches.length,
       },
       meta: {
         source: API_URL,
         fetchedAt: data.fetchedAt,
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2221,62 +2365,64 @@ app.get("/api/matches/:id/statistics", async (req, res) => {
   try {
     const matchId = req.params.id;
     const data = await getPenaltyMatches();
-    const match = data.matches.find(m => String(m.I) === String(matchId));
-    
+    const match = data.matches.find((item) => getMatchId(item) === String(matchId));
+
     if (!match) {
       return res.status(404).json({
         success: false,
         error: {
           code: "MATCH_NOT_FOUND",
-          message: "Match non trouve."
-        }
+          message: "Match non trouve.",
+        },
       });
     }
-    
+
+    const score = getMatchScore(match);
+    const teams = getMatchTeams(match);
     const statistics = {
-      matchId: match.I,
-      homeTeam: match.O1,
-      awayTeam: match.O2,
+      matchId: getMatchId(match),
+      homeTeam: teams.home,
+      awayTeam: teams.away,
       score: {
-        home: match.S1 || 0,
-        away: match.S2 || 0
+        home: score.home,
+        away: score.away,
       },
-      status: match.E,
-      minute: match.M || 0,
+      status: getMatchStatusLabel(match),
+      minute: getMatchMinute(match),
       possession: {
         home: 50,
-        away: 50
+        away: 50,
       },
       shots: {
         home: Math.floor(Math.random() * 15) + 5,
-        away: Math.floor(Math.random() * 15) + 5
+        away: Math.floor(Math.random() * 15) + 5,
       },
       corners: {
         home: Math.floor(Math.random() * 8),
-        away: Math.floor(Math.random() * 8)
+        away: Math.floor(Math.random() * 8),
       },
       fouls: {
         home: Math.floor(Math.random() * 12),
-        away: Math.floor(Math.random() * 12)
+        away: Math.floor(Math.random() * 12),
       },
       yellowCards: {
         home: Math.floor(Math.random() * 3),
-        away: Math.floor(Math.random() * 3)
+        away: Math.floor(Math.random() * 3),
       },
       redCards: {
         home: Math.floor(Math.random() * 2),
-        away: Math.floor(Math.random() * 2)
-      }
+        away: Math.floor(Math.random() * 2),
+      },
     };
-    
+
     res.json({
       success: true,
       data: {
-        statistics: statistics
+        statistics,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2290,49 +2436,43 @@ app.get("/api/matches/:id/statistics", async (req, res) => {
   }
 });
 
-app.get("/api/odds/:matchId", async (req, res) => {
+app.get("/api/odds/:matchId(\\d+)", async (req, res) => {
   try {
-    const matchId = req.params.id;
-    const data = await getPenaltyMatches();
-    const match = data.matches.find(m => String(m.I) === String(matchId));
-    
-    if (!match) {
-      return res.status(404).json({
-        success: false,
-        error: {
-          code: "MATCH_NOT_FOUND",
-          message: "Match non trouve."
-        }
-      });
-    }
-    
-    const bettingMarkets = Array.isArray(match.E) ? match.E : [];
+    const matchId = req.params.matchId;
+    const details = await getMatchPredictionDetails(matchId);
+    const match = details?.match || {};
+    const teams = getMatchTeams(match);
+    const odds1x2 = getMatchOdds(match);
+    const bettingMarkets = Array.isArray(details?.bettingMarkets) ? details.bettingMarkets : [];
+    const over25 = bettingMarkets.find((market) => normalizeLookupText(market?.nom).includes("plus de 2 5"));
+    const under25 = bettingMarkets.find((market) => normalizeLookupText(market?.nom).includes("moins de 2 5"));
+
     const odds = {
-      matchId: match.I,
-      homeTeam: match.O1,
-      awayTeam: match.O2,
+      matchId: getMatchId(match) || String(matchId),
+      homeTeam: teams.home,
+      awayTeam: teams.away,
       markets: {
         "1X2": {
-          "1": bettingMarkets.find(e => e.G === 1)?.O || null,
-          "X": bettingMarkets.find(e => e.G === 3)?.O || null,
-          "2": bettingMarkets.find(e => e.G === 2)?.O || null
+          "1": odds1x2.home,
+          X: odds1x2.draw,
+          "2": odds1x2.away,
         },
         "totalGoals": {
-          "over2.5": bettingMarkets.find(e => e.T && e.T.includes("2.5") && e.T.includes("over"))?.O || null,
-          "under2.5": bettingMarkets.find(e => e.T && e.T.includes("2.5") && e.T.includes("under"))?.O || null
-        }
+          "over2.5": over25?.cote ?? null,
+          "under2.5": under25?.cote ?? null,
+        },
       },
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     };
-    
+
     res.json({
       success: true,
       data: {
-        odds: odds
+        odds,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2350,40 +2490,45 @@ app.get("/api/predictions", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
     const predictions = [];
-    
+
     for (const match of data.matches.slice(0, 20)) {
       try {
-        const details = await getMatchPredictionDetails(match.I);
+        const details = await getMatchPredictionDetails(getMatchId(match));
+        const resolvedMatch = details?.match || match;
+        const teams = getMatchTeams(resolvedMatch);
         if (details.prediction && details.prediction.maitre) {
           predictions.push({
-            matchId: match.I,
-            homeTeam: match.O1,
-            awayTeam: match.O2,
-            league: match.L,
-            status: match.E,
-            score: { home: match.S1, away: match.S2 },
+            matchId: getMatchId(resolvedMatch),
+            homeTeam: teams.home,
+            awayTeam: teams.away,
+            league: getMatchLeague(resolvedMatch),
+            status: getMatchStatusLabel(resolvedMatch),
+            score: getMatchScore(resolvedMatch),
             prediction: {
               recommendation: details.prediction.maitre.decision_finale?.pari_choisi || "N/A",
-              confidence: details.prediction.maitre.decision_finale?.confidence || 0,
-              odds: details.prediction.maitre.decision_finale?.cote || 0
+              confidence:
+                details.prediction.maitre.decision_finale?.confidence ||
+                details.prediction.maitre.decision_finale?.confiance_numerique ||
+                0,
+              odds: details.prediction.maitre.decision_finale?.cote || 0,
             },
-            extraPowerFilter: details.extraPowerFilter
+            extraPowerFilter: details.extraPowerFilter,
           });
         }
       } catch (_error) {
         continue;
       }
     }
-    
+
     res.json({
       success: true,
       data: {
-        predictions: predictions,
-        total: predictions.length
+        predictions,
+        total: predictions.length,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2401,36 +2546,41 @@ app.get("/api/predictions/top", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
     const predictions = [];
-    
+
     for (const match of data.matches.slice(0, 20)) {
       try {
-        const details = await getMatchPredictionDetails(match.I);
+        const details = await getMatchPredictionDetails(getMatchId(match));
+        const resolvedMatch = details?.match || match;
+        const teams = getMatchTeams(resolvedMatch);
         if (details.prediction && details.prediction.maitre) {
-          const confidence = details.prediction.maitre.decision_finale?.confidence || 0;
+          const confidence =
+            details.prediction.maitre.decision_finale?.confidence ||
+            details.prediction.maitre.decision_finale?.confiance_numerique ||
+            0;
           const extraScore = details.extraPowerFilter?.score || 0;
-          const combinedScore = (confidence * 0.6) + (extraScore * 0.4);
-          
+          const combinedScore = confidence * 0.6 + extraScore * 0.4;
+
           predictions.push({
-            matchId: match.I,
-            homeTeam: match.O1,
-            awayTeam: match.O2,
-            league: match.L,
-            status: match.E,
-            score: { home: match.S1, away: match.S2 },
+            matchId: getMatchId(resolvedMatch),
+            homeTeam: teams.home,
+            awayTeam: teams.away,
+            league: getMatchLeague(resolvedMatch),
+            status: getMatchStatusLabel(resolvedMatch),
+            score: getMatchScore(resolvedMatch),
             prediction: {
               recommendation: details.prediction.maitre.decision_finale?.pari_choisi || "N/A",
-              confidence: confidence,
-              odds: details.prediction.maitre.decision_finale?.cote || 0
+              confidence,
+              odds: details.prediction.maitre.decision_finale?.cote || 0,
             },
             extraPowerFilter: details.extraPowerFilter,
-            combinedScore: combinedScore
+            combinedScore,
           });
         }
       } catch (_error) {
         continue;
       }
     }
-    
+
     const topPredictions = predictions
       .sort((a, b) => b.combinedScore - a.combinedScore)
       .slice(0, 10);
@@ -2948,36 +3098,37 @@ app.get("/api/heatmap", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
     const leagueHeatmap = new Map();
-    
-    data.matches.forEach(match => {
-      const league = match.L || match.LE || match.LR || "Unknown";
+
+    data.matches.forEach((match) => {
+      const league = getMatchLeague(match);
       if (!leagueHeatmap.has(league)) {
         leagueHeatmap.set(league, { total: 0, live: 0, upcoming: 0, avgOdds: [] });
       }
       const stats = leagueHeatmap.get(league);
       stats.total++;
-      if (match.E === "LIVE") stats.live++;
-      else if (match.E === "UPCOMING" || (!match.S1 && !match.S2)) stats.upcoming++;
-      
-      const odds = Array.isArray(match.E) ? match.E.find(e => e.G === 1) : null;
-      if (odds && odds.O) stats.avgOdds.push(Number(odds.O));
+      const status = classifyMatchStatus(match);
+      if (status === "live") stats.live++;
+      else if (status === "upcoming") stats.upcoming++;
+
+      const odd = getMatchAverageOdd(match);
+      if (Number.isFinite(odd)) stats.avgOdds.push(odd);
     });
-    
+
     const heatmap = Array.from(leagueHeatmap.entries()).map(([name, stats]) => ({
       name,
       ...stats,
-      avgOdds: stats.avgOdds.length > 0 ? (stats.avgOdds.reduce((a, b) => a + b, 0) / stats.avgOdds.length).toFixed(2) : 0
+      avgOdds: stats.avgOdds.length > 0 ? (stats.avgOdds.reduce((a, b) => a + b, 0) / stats.avgOdds.length).toFixed(2) : 0,
     })).sort((a, b) => b.total - a.total);
-    
+
     res.json({
       success: true,
       data: {
-        heatmap: heatmap,
-        total: heatmap.length
+        heatmap,
+        total: heatmap.length,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -2995,28 +3146,19 @@ app.get("/api/denicheur", async (req, res) => {
   try {
     const fullOption = req.query.full === "true";
     const data = await getPenaltyMatches();
-    const upcomingMatches = data.matches.filter(m => m.E === "UPCOMING" || m.E === "upcoming" || (!m.S1 && !m.S2));
-    
-    const denicheurMatches = upcomingMatches.slice(0, 10).map(match => ({
-      matchId: match.I,
-      homeTeam: match.O1,
-      awayTeam: match.O2,
-      league: match.L,
-      status: match.E,
-      startTime: match.S,
-      odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null
-    }));
-    
+    const upcomingMatches = data.matches.filter((match) => classifyMatchStatus(match) === "upcoming");
+    const denicheurMatches = upcomingMatches.slice(0, 10).map((match) => buildMatchSummary(match));
+
     res.json({
       success: true,
       data: {
         matches: denicheurMatches,
         total: denicheurMatches.length,
-        fullOption: fullOption
+        fullOption,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -3034,33 +3176,27 @@ app.get("/api/odds/alerts", async (_req, res) => {
   try {
     const data = await getPenaltyMatches();
     const alerts = [];
-    
-    data.matches.forEach(match => {
-      const odds = Array.isArray(match.E) ? match.E.find(e => e.G === 1) : null;
-      if (odds && odds.O) {
-        const oddValue = Number(odds.O);
-        if (oddValue > 2.5 || oddValue < 1.3) {
-          alerts.push({
-            matchId: match.I,
-            homeTeam: match.O1,
-            awayTeam: match.O2,
-            league: match.L,
-            odds: oddValue,
-            type: oddValue > 2.5 ? "HIGH_ODD" : "LOW_ODD"
-          });
-        }
+
+    data.matches.forEach((match) => {
+      const oddValue = getMatchPrimaryOdd(match);
+      if (Number.isFinite(oddValue) && (oddValue > 2.5 || oddValue < 1.3)) {
+        alerts.push({
+          ...buildMatchSummary(match),
+          odds: oddValue,
+          type: oddValue > 2.5 ? "HIGH_ODD" : "LOW_ODD",
+        });
       }
     });
-    
+
     res.json({
       success: true,
       data: {
-        alerts: alerts,
-        total: alerts.length
+        alerts,
+        total: alerts.length,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -3078,46 +3214,30 @@ app.post("/api/coupon/generate", async (req, res) => {
   try {
     const { size = 3, league = "all", risk = "balanced", stake = 1000 } = req.body;
     const data = await getPenaltyMatches();
-    const nowSec = Math.floor(Date.now() / 1000);
-    
+
     let matches = data.matches;
     if (league !== "all") {
-      matches = matches.filter((match) => String(match?.league || "") === String(league));
+      matches = matches.filter((match) => matchMatchesLeague(match, league));
     }
-    
-    const upcomingMatches = matches.filter((match) => {
-      const startTime = Number(match?.startTimeUnix) || 0;
-      const statusCode = Number(match?.statusCode);
-      const statusText = String(match?.statusText || "").toLowerCase();
-      const infoText = String(match?.infoText || "").toLowerCase();
-      return (
-        (startTime > nowSec && statusCode === 128) ||
-        statusText.includes("debut dans") ||
-        infoText.includes("avant le debut")
-      );
-    });
+
+    const upcomingMatches = matches.filter((match) => classifyMatchStatus(match) === "upcoming");
     const selectedMatches = upcomingMatches.slice(0, size);
-    
+
     const couponId = `coupon_${Date.now()}`;
     const coupon = {
       id: couponId,
-      matches: selectedMatches.map(match => ({
-        matchId: String(match.id || ""),
-        homeTeam: match.teamHome,
-        awayTeam: match.teamAway,
-        league: match.league,
-        startTime: match.startTimeUnix,
-        odds: Number(match?.odds1x2?.home) || null,
-        prediction: { recommendation: "1", confidence: 0.75 }
+      matches: selectedMatches.map((match) => ({
+        ...buildMatchSummary(match),
+        prediction: { recommendation: "1", confidence: 0.75 },
       })),
       config: { size, league, risk, stake },
       calculated: {
-        totalOdds: selectedMatches.reduce((acc, match) => acc * (Number(match?.odds1x2?.home) || 1.5), 1),
-        potentialWin: 0
+        totalOdds: selectedMatches.reduce((acc, match) => acc * (getMatchPrimaryOdd(match) || 1.5), 1),
+        potentialWin: 0,
       },
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     };
-    
+
     coupon.calculated.potentialWin = Math.round(coupon.calculated.totalOdds * stake);
     
     await saveCouponGeneration({
@@ -3130,18 +3250,18 @@ app.post("/api/coupon/generate", async (req, res) => {
         couponId,
         totalOdds: coupon.calculated.totalOdds,
         potentialWin: coupon.calculated.potentialWin,
-        matchesCount: coupon.matches.length
-      }
+        matchesCount: coupon.matches.length,
+      },
     });
-    
+
     res.json({
       success: true,
       data: {
-        coupon: coupon
+        coupon,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -3202,53 +3322,38 @@ app.post("/api/coupon/ladder", async (req, res) => {
   try {
     const { size = 3, league = "all", stake = 1000 } = req.body;
     const data = await getPenaltyMatches();
-    
+
     let matches = data.matches;
     if (league !== "all") {
-      matches = matches.filter(m => m.L === league || m.LE === league || m.LR === league);
+      matches = matches.filter((match) => matchMatchesLeague(match, league));
     }
-    
-    const upcomingMatches = matches.filter(m => m.E === "UPCOMING" || m.E === "upcoming" || (!m.S1 && !m.S2));
+
+    const upcomingMatches = matches.filter((match) => classifyMatchStatus(match) === "upcoming");
     const selectedMatches = upcomingMatches.slice(0, size);
-    
+
     const ladderId = `ladder_${Date.now()}`;
     const ladder = {
       id: ladderId,
       coupons: [
         {
           name: "Safe (60%)",
-          matches: selectedMatches.slice(0, Math.ceil(size * 0.6)).map(match => ({
-            matchId: match.I,
-            homeTeam: match.O1,
-            awayTeam: match.O2,
-            odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null
-          })),
-          stake: Math.round(stake * 0.6)
+          matches: selectedMatches.slice(0, Math.ceil(size * 0.6)).map((match) => buildMatchSummary(match)),
+          stake: Math.round(stake * 0.6),
         },
         {
           name: "Balanced (30%)",
-          matches: selectedMatches.slice(0, Math.ceil(size * 0.3)).map(match => ({
-            matchId: match.I,
-            homeTeam: match.O1,
-            awayTeam: match.O2,
-            odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null
-          })),
-          stake: Math.round(stake * 0.3)
+          matches: selectedMatches.slice(0, Math.ceil(size * 0.3)).map((match) => buildMatchSummary(match)),
+          stake: Math.round(stake * 0.3),
         },
         {
           name: "Aggressive (10%)",
-          matches: selectedMatches.slice(0, Math.ceil(size * 0.1)).map(match => ({
-            matchId: match.I,
-            homeTeam: match.O1,
-            awayTeam: match.O2,
-            odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null
-          })),
-          stake: Math.round(stake * 0.1)
-        }
+          matches: selectedMatches.slice(0, Math.ceil(size * 0.1)).map((match) => buildMatchSummary(match)),
+          stake: Math.round(stake * 0.1),
+        },
       ],
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     };
-    
+
     await saveCouponGeneration({
       size,
       league,
@@ -3258,18 +3363,18 @@ app.post("/api/coupon/ladder", async (req, res) => {
       summary: {
         ladderId,
         couponsCount: ladder.coupons.length,
-        totalStake: stake
-      }
+        totalStake: stake,
+      },
     });
-    
+
     res.json({
       success: true,
       data: {
-        ladder: ladder
+        ladder,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -3287,63 +3392,51 @@ app.post("/api/coupon/multi", async (req, res) => {
   try {
     const { size = 3, league = "all", stake = 1000 } = req.body;
     const data = await getPenaltyMatches();
-    
+
     let matches = data.matches;
     if (league !== "all") {
-      matches = matches.filter(m => m.L === league || m.LE === league || m.LR === league);
+      matches = matches.filter((match) => matchMatchesLeague(match, league));
     }
-    
-    const upcomingMatches = matches.filter(m => m.E === "UPCOMING" || m.E === "upcoming" || (!m.S1 && !m.S2));
+
+    const upcomingMatches = matches.filter((match) => classifyMatchStatus(match) === "upcoming");
     const selectedMatches = upcomingMatches.slice(0, size);
-    
+
     const multiId = `multi_${Date.now()}`;
     const strategies = [
       {
         name: "Ultra-Safe",
         risk: "ultra_safe",
-        matches: selectedMatches.slice(0, size).map(match => ({
-          matchId: match.I,
-          homeTeam: match.O1,
-          awayTeam: match.O2,
-          odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null,
-          prediction: { recommendation: "1", confidence: 0.90 }
-        }))
+        matches: selectedMatches.slice(0, size).map((match) => ({
+          ...buildMatchSummary(match),
+          prediction: { recommendation: "1", confidence: 0.90 },
+        })),
       },
       {
         name: "Safe",
         risk: "safe",
-        matches: selectedMatches.slice(0, size).map(match => ({
-          matchId: match.I,
-          homeTeam: match.O1,
-          awayTeam: match.O2,
-          odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null,
-          prediction: { recommendation: "1", confidence: 0.80 }
-        }))
+        matches: selectedMatches.slice(0, size).map((match) => ({
+          ...buildMatchSummary(match),
+          prediction: { recommendation: "1", confidence: 0.80 },
+        })),
       },
       {
         name: "Balanced",
         risk: "balanced",
-        matches: selectedMatches.slice(0, size).map(match => ({
-          matchId: match.I,
-          homeTeam: match.O1,
-          awayTeam: match.O2,
-          odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null,
-          prediction: { recommendation: "1", confidence: 0.70 }
-        }))
+        matches: selectedMatches.slice(0, size).map((match) => ({
+          ...buildMatchSummary(match),
+          prediction: { recommendation: "1", confidence: 0.70 },
+        })),
       },
       {
         name: "Aggressive",
         risk: "aggressive",
-        matches: selectedMatches.slice(0, size).map(match => ({
-          matchId: match.I,
-          homeTeam: match.O1,
-          awayTeam: match.O2,
-          odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null,
-          prediction: { recommendation: "1", confidence: 0.60 }
-        }))
-      }
+        matches: selectedMatches.slice(0, size).map((match) => ({
+          ...buildMatchSummary(match),
+          prediction: { recommendation: "1", confidence: 0.60 },
+        })),
+      },
     ];
-    
+
     await saveCouponGeneration({
       size,
       league,
@@ -3353,18 +3446,18 @@ app.post("/api/coupon/multi", async (req, res) => {
       summary: {
         multiId,
         strategiesCount: strategies.length,
-        totalStake: stake
-      }
+        totalStake: stake,
+      },
     });
-    
+
     res.json({
       success: true,
       data: {
-        strategies: strategies
+        strategies,
       },
       meta: {
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -3417,15 +3510,16 @@ app.get("/api/match/:id/kpi", async (req, res) => {
   try {
     const matchId = req.params.id;
     const data = await getPenaltyMatches();
-    const match = data.matches.find(m => String(m.I) === String(matchId));
+    const match = data.matches.find((item) => getMatchId(item) === String(matchId));
+    const teams = match ? getMatchTeams(match) : { home: "Equipe Domicile", away: "Equipe Exterieur" };
     
     const homeTeam = match ? match.O1 : "Équipe Domicile";
     const awayTeam = match ? match.O2 : "Équipe Extérieur";
     
     const kpi = {
       matchId: matchId,
-      homeTeam: homeTeam,
-      awayTeam: awayTeam,
+      homeTeam: teams.home,
+      awayTeam: teams.away,
       metrics: {
         momentum: Math.random() * 100,
         form: Math.random() * 100,
@@ -3470,7 +3564,8 @@ app.get("/api/match/:id/insight", async (req, res) => {
   try {
     const matchId = req.params.id;
     const data = await getPenaltyMatches();
-    const match = data.matches.find(m => String(m.I) === String(matchId));
+    const match = data.matches.find((item) => getMatchId(item) === String(matchId));
+    const teams = match ? getMatchTeams(match) : { home: "Equipe Domicile", away: "Equipe Exterieur" };
     
     const homeTeam = match ? match.O1 : "Équipe Domicile";
     const awayTeam = match ? match.O2 : "Équipe Extérieur";
@@ -3524,15 +3619,16 @@ app.get("/api/match/:id/exact-score", async (req, res) => {
   try {
     const matchId = req.params.id;
     const data = await getPenaltyMatches();
-    const match = data.matches.find(m => String(m.I) === String(matchId));
+    const match = data.matches.find((item) => getMatchId(item) === String(matchId));
+    const teams = match ? getMatchTeams(match) : { home: "Equipe Domicile", away: "Equipe Exterieur" };
     
     const homeTeam = match ? match.O1 : "Équipe Domicile";
     const awayTeam = match ? match.O2 : "Équipe Extérieur";
     
     const exactScore = {
       matchId: matchId,
-      homeTeam: homeTeam,
-      awayTeam: awayTeam,
+      homeTeam: teams.home,
+      awayTeam: teams.away,
       predictions: [
         { score: "1-0", probability: 0.35 },
         { score: "2-1", probability: 0.25 },
@@ -3572,10 +3668,7 @@ app.get("/api/stats/global", async (_req, res) => {
     const couponLimit = 500;
     const couponItems = await getCouponHistory(couponLimit);
     
-    const totalMatches = data.matches.length;
-    const liveMatches = data.matches.filter(m => m.E === "LIVE" || m.E === "live").length;
-    const upcomingMatches = data.matches.filter(m => m.E === "UPCOMING" || m.E === "upcoming" || (!m.S1 && !m.S2)).length;
-    const finishedMatches = data.matches.filter(m => m.E === "FINISHED" || m.E === "finished" || (m.S1 !== null && m.S2 !== null && m.E !== "LIVE")).length;
+    const matchSummary = summarizeMatchBuckets(data.matches);
     
     const totalCoupons = couponItems.length;
     const wonCoupons = couponItems.filter(item => item.status === "won" || item.valid === true).length;
@@ -3591,16 +3684,17 @@ app.get("/api/stats/global", async (_req, res) => {
     });
     
     const leagueStats = new Map();
-    data.matches.forEach(match => {
-      const league = match.L || match.LE || match.LR || "Unknown";
+    data.matches.forEach((match) => {
+      const league = getMatchLeague(match);
       if (!leagueStats.has(league)) {
         leagueStats.set(league, { total: 0, live: 0, upcoming: 0, finished: 0 });
       }
       const stats = leagueStats.get(league);
       stats.total++;
-      if (match.E === "LIVE") stats.live++;
-      else if (match.E === "UPCOMING" || (!match.S1 && !match.S2)) stats.upcoming++;
-      else if (match.E === "FINISHED" || (match.S1 !== null && match.S2 !== null)) stats.finished++;
+      const status = classifyMatchStatus(match);
+      if (status === "live") stats.live++;
+      else if (status === "finished") stats.finished++;
+      else stats.upcoming++;
     });
     
     const leagues = Array.from(leagueStats.entries()).map(([name, stats]) => ({ name, ...stats }));
@@ -3610,10 +3704,10 @@ app.get("/api/stats/global", async (_req, res) => {
       data: {
         global: {
           matches: {
-            total: totalMatches,
-            live: liveMatches,
-            upcoming: upcomingMatches,
-            finished: finishedMatches
+            total: matchSummary.total,
+            live: matchSummary.live,
+            upcoming: matchSummary.upcoming,
+            finished: matchSummary.finished
           },
           coupons: {
             total: totalCoupons,
@@ -3650,10 +3744,7 @@ app.get("/api/stats/overview", async (_req, res) => {
     const couponLimit = 500;
     const couponItems = await getCouponHistory(couponLimit);
     
-    const totalMatches = data.matches.length;
-    const liveMatches = data.matches.filter(m => m.E === "LIVE").length;
-    const upcomingMatches = data.matches.filter(m => m.E === "UPCOMING" || (!m.S1 && !m.S2)).length;
-    const finishedMatches = data.matches.filter(m => m.E === "FINISHED" || (m.S1 !== null && m.S2 !== null && m.E !== "LIVE")).length;
+    const matchSummary = summarizeMatchBuckets(data.matches);
     
     const totalCoupons = couponItems.length;
     const wonCoupons = couponItems.filter(item => item.status === "won" || item.valid === true).length;
@@ -3664,10 +3755,10 @@ app.get("/api/stats/overview", async (_req, res) => {
       data: {
         overview: {
           matches: {
-            total: totalMatches,
-            live: liveMatches,
-            upcoming: upcomingMatches,
-            finished: finishedMatches
+            total: matchSummary.total,
+            live: matchSummary.live,
+            upcoming: matchSummary.upcoming,
+            finished: matchSummary.finished
           },
           coupons: {
             total: totalCoupons,

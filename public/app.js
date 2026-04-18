@@ -1603,17 +1603,24 @@ async function loadMatches() {
 
     if (requestId !== lastLoadRequestId) return;
 
+    const payload = data?.data && typeof data.data === "object" ? data.data : data;
+    const meta = data?.meta && typeof data.meta === "object" ? data.meta : {};
     const knownLogos = buildKnownTeamLogoMap(allMatches);
-    const rawMatches = Array.isArray(data.matches) ? data.matches.map((match) => sanitizeMatchLogos(match, knownLogos)) : [];
-    lastFetchedAt = data.fetchedAt || null;
+    const rawMatches = Array.isArray(payload.matches)
+      ? payload.matches.map((match) => sanitizeMatchLogos(match, knownLogos))
+      : Array.isArray(data.matches)
+        ? data.matches.map((match) => sanitizeMatchLogos(match, knownLogos))
+        : [];
+    lastFetchedAt = meta.fetchedAt || data.fetchedAt || null;
     allMatches = enrichWithTrend(rawMatches);
     updateWatchlistAlerts(allMatches);
-    const mode = data.filterMode === "keyword-penalty" ? "filtre mot-cle" : "fallback groupe gr=285";
+    const filterMode = payload.filterMode || data.filterMode || "unknown";
+    const mode = filterMode === "keyword-penalty" ? "filtre mot-cle" : "fallback groupe gr=285";
     currentModeLabel = `mode: ${mode}`;
 
-    statsWrap.appendChild(createStat("Total API", data.totalFromApi ?? "-"));
-    statsWrap.appendChild(createStat("Sport 85", data.totalSport85 ?? "-"));
-    statsWrap.appendChild(createStat("Penalty", data.totalPenalty ?? "-"));
+    statsWrap.appendChild(createStat("Total API", payload.totalFromApi ?? data.totalFromApi ?? "-"));
+    statsWrap.appendChild(createStat("Sport 85", payload.totalSport85 ?? data.totalSport85 ?? "-"));
+    statsWrap.appendChild(createStat("Penalty", payload.totalPenalty ?? data.totalPenalty ?? "-"));
     statsWrap.appendChild(createStat("Ligues", uniqueLeagues(allMatches).length));
 
     populateLeagueFilter(allMatches);
@@ -1623,14 +1630,16 @@ async function loadMatches() {
     renderLeagueHeatmap(allMatches);
     renderMatchFinder(allMatches);
     renderMatches();
-    updatedAt.textContent = `Derniere mise a jour: ${new Date(data.fetchedAt).toLocaleString("fr-FR")}`;
+    updatedAt.textContent = lastFetchedAt
+      ? `Derniere mise a jour: ${new Date(lastFetchedAt).toLocaleString("fr-FR")}`
+      : "";
     hydrateDirectTeamLogos(allMatches).then(() => {
       if (requestId !== lastLoadRequestId) return;
       renderWatchlistPanel(allMatches);
       renderMatchFinder(allMatches);
       renderMatches();
     });
-    siteLog("log", "home_matches_loaded", { count: allMatches.length, mode: data.filterMode || "unknown" });
+    siteLog("log", "home_matches_loaded", { count: allMatches.length, mode: filterMode });
   } catch (error) {
     subTitle.textContent = "Erreur de chargement";
     emptyState.classList.remove("hidden");
