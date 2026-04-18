@@ -75,6 +75,33 @@ sqliteDb.exec(`
   );
 `);
 
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS watchlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    user_id TEXT NOT NULL UNIQUE,
+    match_ids_json TEXT,
+    snapshot_json TEXT
+  );
+`);
+
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS mobile_devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    user_id TEXT,
+    platform TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    push_token TEXT,
+    app_version TEXT,
+    meta_json TEXT,
+    UNIQUE(platform, device_id)
+  );
+`);
+
 const sqliteInsertCouponGenerationStmt = sqliteDb.prepare(`
   INSERT INTO coupon_generations (size, league, risk, source, summary_json, coupon_json)
   VALUES (?, ?, ?, ?, ?, ?)
@@ -129,6 +156,41 @@ const sqliteSelectAuditHistoryStmt = sqliteDb.prepare(`
   LIMIT ?
 `);
 
+const sqliteUpsertWatchlistStmt = sqliteDb.prepare(`
+  INSERT INTO watchlists (user_id, match_ids_json, snapshot_json)
+  VALUES (?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    match_ids_json = excluded.match_ids_json,
+    snapshot_json = excluded.snapshot_json,
+    updated_at = datetime('now')
+`);
+
+const sqliteSelectWatchlistStmt = sqliteDb.prepare(`
+  SELECT id, created_at, updated_at, user_id, match_ids_json, snapshot_json
+  FROM watchlists
+  WHERE user_id = ?
+  LIMIT 1
+`);
+
+const sqliteUpsertMobileDeviceStmt = sqliteDb.prepare(`
+  INSERT INTO mobile_devices (user_id, platform, device_id, push_token, app_version, meta_json)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(platform, device_id) DO UPDATE SET
+    user_id = excluded.user_id,
+    push_token = excluded.push_token,
+    app_version = excluded.app_version,
+    meta_json = excluded.meta_json,
+    updated_at = datetime('now'),
+    last_seen_at = datetime('now')
+`);
+
+const sqliteSelectMobileDeviceStmt = sqliteDb.prepare(`
+  SELECT id, created_at, updated_at, last_seen_at, user_id, platform, device_id, push_token, app_version, meta_json
+  FROM mobile_devices
+  WHERE platform = ? AND device_id = ?
+  LIMIT 1
+`);
+
 const mysqlConfig = {
   host: String(process.env.DB_HOST || "").trim(),
   port: Number(process.env.DB_PORT) || 3306,
@@ -174,6 +236,31 @@ function buildSavedOptions(entry = {}) {
     message: entry.message ? String(entry.message) : null,
     action: entry.action ? String(entry.action) : null,
   };
+}
+
+function normalizeUserId(value, fallback = "anonymous") {
+  const safeValue = String(value || "").trim();
+  return safeValue || fallback;
+}
+
+function normalizeStringArray(items, limit = 200) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const output = [];
+
+  for (const item of items) {
+    const safeValue = String(item || "").trim();
+    if (!safeValue || seen.has(safeValue)) continue;
+    seen.add(safeValue);
+    output.push(safeValue);
+    if (output.length >= limit) break;
+  }
+
+  return output;
+}
+
+function normalizeObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
 async function initMySql() {
@@ -254,6 +341,34 @@ async function initMySql() {
           user_id VARCHAR(255) NULL,
           coupon_id VARCHAR(255) NOT NULL,
           coupon_json LONGTEXT NULL
+        )
+      `);
+
+      await mysqlPool.query(`
+        CREATE TABLE IF NOT EXISTS watchlists (
+          id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          user_id VARCHAR(255) NOT NULL,
+          match_ids_json LONGTEXT NULL,
+          snapshot_json LONGTEXT NULL,
+          UNIQUE KEY uniq_watchlists_user_id (user_id)
+        )
+      `);
+
+      await mysqlPool.query(`
+        CREATE TABLE IF NOT EXISTS mobile_devices (
+          id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          user_id VARCHAR(255) NULL,
+          platform VARCHAR(50) NOT NULL,
+          device_id VARCHAR(255) NOT NULL,
+          push_token TEXT NULL,
+          app_version VARCHAR(120) NULL,
+          meta_json LONGTEXT NULL,
+          UNIQUE KEY uniq_mobile_devices_platform_device_id (platform, device_id)
         )
       `);
 
@@ -495,7 +610,7 @@ async function saveFavorite(entry = {}) {
 
 async function getFavorites(userId = "anonymous", limit = 20) {
   const safeLimit = Math.max(1, Math.min(200, Number(limit) || 20));
-  const safeUserId = String(userId);
+  const safeUserId = normalizeUserId(userId);
 
   if (await canUseMySql()) {
     const [rows] = await mysqlPool.execute(
@@ -522,6 +637,159 @@ async function getFavorites(userId = "anonymous", limit = 20) {
     couponId: row.coupon_id,
     coupon: parseJsonSafe(row.coupon_json, {}),
   }));
+}
+
+async function saveWatchlist(entry = {}) {
+  const userId = normalizeUserId(entry.userId, "default");
+  const matchIds = normalizeStringArray(entry.matchIds || entry.watchlist, 300);
+  const snapshot = normalizeObject(entry.snapshot);
+
+  if (await canUseMySql()) {
+    await mysqlPool.execute(
+      `INSERT INTO watchlists (user_id, match_ids_json, snapshot_json)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         match_ids_json = VALUES(match_ids_json),
+         snapshot_json = VALUES(snapshot_json),
+         updated_at = CURRENT_TIMESTAMP`,
+      [userId, toJson(matchIds, []), toJson(snapshot, {})]
+    );
+    const [rows] = await mysqlPool.execute(
+      `SELECT id, created_at, updated_at, user_id, match_ids_json, snapshot_json
+       FROM watchlists
+       WHERE user_id = ?
+       LIMIT 1`,
+      [userId]
+    );
+    const row = rows[0];
+    return {
+      id: row?.id || null,
+      createdAt: normalizeDate(row?.created_at),
+      updatedAt: normalizeDate(row?.updated_at),
+      userId: row?.user_id || userId,
+      matchIds: parseJsonSafe(row?.match_ids_json, []),
+      snapshot: parseJsonSafe(row?.snapshot_json, {}),
+    };
+  }
+
+  sqliteUpsertWatchlistStmt.run(
+    userId,
+    toJson(matchIds, []),
+    toJson(snapshot, {})
+  );
+  const row = sqliteSelectWatchlistStmt.get(userId);
+  return {
+    id: row?.id || null,
+    createdAt: row?.created_at || null,
+    updatedAt: row?.updated_at || null,
+    userId: row?.user_id || userId,
+    matchIds: parseJsonSafe(row?.match_ids_json, []),
+    snapshot: parseJsonSafe(row?.snapshot_json, {}),
+  };
+}
+
+async function getWatchlist(userId = "default") {
+  const safeUserId = normalizeUserId(userId, "default");
+
+  if (await canUseMySql()) {
+    const [rows] = await mysqlPool.execute(
+      `SELECT id, created_at, updated_at, user_id, match_ids_json, snapshot_json
+       FROM watchlists
+       WHERE user_id = ?
+       LIMIT 1`,
+      [safeUserId]
+    );
+    const row = rows[0];
+    return {
+      id: row?.id || null,
+      createdAt: normalizeDate(row?.created_at),
+      updatedAt: normalizeDate(row?.updated_at),
+      userId: row?.user_id || safeUserId,
+      matchIds: parseJsonSafe(row?.match_ids_json, []),
+      snapshot: parseJsonSafe(row?.snapshot_json, {}),
+    };
+  }
+
+  const row = sqliteSelectWatchlistStmt.get(safeUserId);
+  return {
+    id: row?.id || null,
+    createdAt: row?.created_at || null,
+    updatedAt: row?.updated_at || null,
+    userId: row?.user_id || safeUserId,
+    matchIds: parseJsonSafe(row?.match_ids_json, []),
+    snapshot: parseJsonSafe(row?.snapshot_json, {}),
+  };
+}
+
+async function registerMobileDevice(entry = {}) {
+  const platform = String(entry.platform || "android").trim().toLowerCase() || "android";
+  const deviceId = String(entry.deviceId || "").trim();
+
+  if (!deviceId) {
+    throw new Error("device_id requis");
+  }
+
+  const userId = entry.userId == null ? null : normalizeUserId(entry.userId, "default");
+  const pushToken = entry.pushToken ? String(entry.pushToken).trim() : null;
+  const appVersion = entry.appVersion ? String(entry.appVersion).trim() : null;
+  const meta = normalizeObject(entry.meta);
+
+  if (await canUseMySql()) {
+    await mysqlPool.execute(
+      `INSERT INTO mobile_devices (user_id, platform, device_id, push_token, app_version, meta_json, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON DUPLICATE KEY UPDATE
+         user_id = VALUES(user_id),
+         push_token = VALUES(push_token),
+         app_version = VALUES(app_version),
+         meta_json = VALUES(meta_json),
+         updated_at = CURRENT_TIMESTAMP,
+         last_seen_at = CURRENT_TIMESTAMP`,
+      [userId, platform, deviceId, pushToken, appVersion, toJson(meta, {})]
+    );
+    const [rows] = await mysqlPool.execute(
+      `SELECT id, created_at, updated_at, last_seen_at, user_id, platform, device_id, push_token, app_version, meta_json
+       FROM mobile_devices
+       WHERE platform = ? AND device_id = ?
+       LIMIT 1`,
+      [platform, deviceId]
+    );
+    const row = rows[0];
+    return {
+      id: row?.id || null,
+      createdAt: normalizeDate(row?.created_at),
+      updatedAt: normalizeDate(row?.updated_at),
+      lastSeenAt: normalizeDate(row?.last_seen_at),
+      userId: row?.user_id || userId,
+      platform: row?.platform || platform,
+      deviceId: row?.device_id || deviceId,
+      pushTokenRegistered: Boolean(row?.push_token),
+      appVersion: row?.app_version || appVersion,
+      meta: parseJsonSafe(row?.meta_json, {}),
+    };
+  }
+
+  sqliteUpsertMobileDeviceStmt.run(
+    userId,
+    platform,
+    deviceId,
+    pushToken,
+    appVersion,
+    toJson(meta, {})
+  );
+  const row = sqliteSelectMobileDeviceStmt.get(platform, deviceId);
+  return {
+    id: row?.id || null,
+    createdAt: row?.created_at || null,
+    updatedAt: row?.updated_at || null,
+    lastSeenAt: row?.last_seen_at || null,
+    userId: row?.user_id || userId,
+    platform: row?.platform || platform,
+    deviceId: row?.device_id || deviceId,
+    pushTokenRegistered: Boolean(row?.push_token),
+    appVersion: row?.app_version || appVersion,
+    meta: parseJsonSafe(row?.meta_json, {}),
+  };
 }
 
 async function getAuditHistory(limit = 20) {
@@ -562,6 +830,9 @@ async function getDbStatus() {
     const [validationRows] = await mysqlPool.query("SELECT COUNT(*) AS c FROM coupon_validations");
     const [telegramRows] = await mysqlPool.query("SELECT COUNT(*) AS c FROM telegram_logs");
     const [auditRows] = await mysqlPool.query("SELECT COUNT(*) AS c FROM audit_reports");
+    const [favoriteRows] = await mysqlPool.query("SELECT COUNT(*) AS c FROM favorites");
+    const [watchlistRows] = await mysqlPool.query("SELECT COUNT(*) AS c FROM watchlists");
+    const [deviceRows] = await mysqlPool.query("SELECT COUNT(*) AS c FROM mobile_devices");
 
     return {
       ok: true,
@@ -573,6 +844,9 @@ async function getDbStatus() {
         coupon_validations: Number(validationRows?.[0]?.c) || 0,
         telegram_logs: Number(telegramRows?.[0]?.c) || 0,
         audit_reports: Number(auditRows?.[0]?.c) || 0,
+        favorites: Number(favoriteRows?.[0]?.c) || 0,
+        watchlists: Number(watchlistRows?.[0]?.c) || 0,
+        mobile_devices: Number(deviceRows?.[0]?.c) || 0,
       },
     };
   }
@@ -581,6 +855,9 @@ async function getDbStatus() {
   const validationCount = sqliteDb.prepare("SELECT COUNT(*) AS c FROM coupon_validations").get().c;
   const telegramCount = sqliteDb.prepare("SELECT COUNT(*) AS c FROM telegram_logs").get().c;
   const auditCount = sqliteDb.prepare("SELECT COUNT(*) AS c FROM audit_reports").get().c;
+  const favoriteCount = sqliteDb.prepare("SELECT COUNT(*) AS c FROM favorites").get().c;
+  const watchlistCount = sqliteDb.prepare("SELECT COUNT(*) AS c FROM watchlists").get().c;
+  const deviceCount = sqliteDb.prepare("SELECT COUNT(*) AS c FROM mobile_devices").get().c;
 
   return {
     ok: true,
@@ -593,6 +870,9 @@ async function getDbStatus() {
       coupon_validations: Number(validationCount) || 0,
       telegram_logs: Number(telegramCount) || 0,
       audit_reports: Number(auditCount) || 0,
+      favorites: Number(favoriteCount) || 0,
+      watchlists: Number(watchlistCount) || 0,
+      mobile_devices: Number(deviceCount) || 0,
     },
   };
 }
@@ -608,4 +888,7 @@ module.exports = {
   getDbStatus,
   saveFavorite,
   getFavorites,
+  saveWatchlist,
+  getWatchlist,
+  registerMobileDevice,
 };

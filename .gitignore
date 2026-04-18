@@ -6,3 +6,5 @@ Thumbs.db
 *.tmp
 *.cache
 android-mobile-app/
+*.sqlite-shm
+*.sqlite-wal

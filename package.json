@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "lint": "eslint public --ext .js --max-warnings 200"
+    "lint": "eslint public --ext .js --max-warnings 200",
+    "check:server": "node --check server.js && node --check services/db.js && node --check services/database.js"
   },
   "keywords": [
     "node",

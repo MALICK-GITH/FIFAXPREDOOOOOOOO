@@ -1,26 +1,43 @@
 // Database Service - PostgreSQL Integration for FIFA PRO
 const { Pool } = require('pg');
 
-// Database configuration
-const pool = new Pool({
-  host: process.env.DB_HOST || 'dpg-d74t286a2pns73ap1dp0-a.oregon-postgres.render.com',
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME || 'mkfifx',
-  user: process.env.DB_USER || 'mkfifx_user',
-  password: process.env.DB_PASSWORD || 'gDx1L4YMF64q1iugFRbjWtMpTEAeiaxe',
-  ssl: { rejectUnauthorized: false },
+const databaseConfig = {
+  host: String(process.env.DB_HOST || '').trim(),
+  port: Number(process.env.DB_PORT) || 5432,
+  database: String(process.env.DB_NAME || '').trim(),
+  user: String(process.env.DB_USER || '').trim(),
+  password: String(process.env.DB_PASSWORD || '').trim(),
+  ssl:
+    String(process.env.DB_SSL || 'true').trim().toLowerCase() === 'false'
+      ? false
+      : { rejectUnauthorized: false },
   max: 20, // Maximum number of connections
   idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
   connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
-});
+};
+
+const databaseEnabled = Boolean(
+  databaseConfig.host &&
+    databaseConfig.database &&
+    databaseConfig.user &&
+    databaseConfig.password
+);
+
+const pool = databaseEnabled ? new Pool(databaseConfig) : null;
 
 class DatabaseService {
   constructor() {
     this.pool = pool;
-    this.init();
+    this.enabled = databaseEnabled;
+    if (this.enabled) {
+      this.init();
+    } else {
+      console.log('ℹ️ PostgreSQL disabled: configure DB_HOST, DB_NAME, DB_USER and DB_PASSWORD to enable it.');
+    }
   }
 
   async init() {
+    if (!this.enabled || !this.pool) return;
     try {
       // Test connection
       const client = await this.pool.connect();
@@ -142,6 +159,9 @@ class DatabaseService {
   }
 
   async query(text, params = []) {
+    if (!this.enabled || !this.pool) {
+      throw new Error('PostgreSQL database not configured.');
+    }
     const start = Date.now();
     try {
       const result = await this.pool.query(text, params);
@@ -158,7 +178,7 @@ class DatabaseService {
   async saveMatch(matchData) {
     const query = `
       INSERT INTO matches (match_id, team1, team2, league, score1, score2, minute, status, odds, prediction)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       ON CONFLICT (match_id) DO UPDATE SET
         team1 = EXCLUDED.team1,
         team2 = EXCLUDED.team2,
@@ -225,7 +245,7 @@ class DatabaseService {
   async saveCoupon(couponData) {
     const query = `
       INSERT INTO coupons (coupon_id, user_id, matches, stake, total_odds, potential_win, risk_profile, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *
     `;
     
@@ -403,6 +423,13 @@ class DatabaseService {
 
   // Health check
   async healthCheck() {
+    if (!this.enabled || !this.pool) {
+      return {
+        status: 'disabled',
+        timestamp: new Date().toISOString(),
+        database: 'not_configured',
+      };
+    }
     try {
       const result = await this.query('SELECT 1 as health');
       return {
@@ -421,6 +448,7 @@ class DatabaseService {
 
   // Close connection
   async close() {
+    if (!this.pool) return;
     await this.pool.end();
     console.log('🔌 Database connection closed');
   }

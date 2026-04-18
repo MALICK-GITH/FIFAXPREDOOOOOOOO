@@ -15,6 +15,9 @@ const {
   getDbStatus,
   saveFavorite,
   getFavorites,
+  saveWatchlist,
+  getWatchlist,
+  registerMobileDevice,
 } = require("./services/db");
 
 // Import PostgreSQL database service
@@ -32,18 +35,24 @@ const heavyPostState = new Map();
 const SERVER_STARTED_AT = Date.now();
 const CHAT_IO_TIMEOUT_MS = 3500;
 const CHAT_PROVIDER_TIMEOUT_MS = 7000;
+const MOBILE_API_VERSION = "2026-04-18-android";
+const ANDROID_MIN_SDK = 26;
+const ANDROID_TARGET_SDK = 35;
+const ANDROID_PACKAGE_NAME = "com.solitairehack.solitfifpro225";
 
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json());
 
 app.get("/health", async (_req, res) => {
   try {
-    const dbHealth = await dbService.healthCheck();
+    const dbHealth = await getDbStatus();
+    const postgresHealth = await dbService.healthCheck();
     res.json({
       ok: true,
       uptimeSec: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
       startedAt: new Date(SERVER_STARTED_AT).toISOString(),
       database: dbHealth,
+      auxiliaryPostgres: postgresHealth,
     });
   } catch (error) {
     res.json({
@@ -170,6 +179,108 @@ function teamColors(name = "") {
 function trimText(value, max = 1200) {
   const text = String(value || "").trim();
   return text.length > max ? text.slice(0, max) : text;
+}
+
+function normalizeUserIdentifier(value, fallback = "anonymous") {
+  const safeValue = trimText(value, 120);
+  return safeValue || fallback;
+}
+
+function normalizeIdList(values, limit = 300) {
+  if (!Array.isArray(values)) return [];
+  const output = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    const safeValue = trimText(value, 80);
+    if (!safeValue || seen.has(safeValue)) continue;
+    seen.add(safeValue);
+    output.push(safeValue);
+    if (output.length >= limit) break;
+  }
+
+  return output;
+}
+
+function normalizePlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function buildMobileBootstrapData(dbStatus = {}) {
+  return {
+    app: {
+      name: "SOLITFIFPRO225",
+      apiVersion: MOBILE_API_VERSION,
+      suggestedAndroidPackage: ANDROID_PACKAGE_NAME,
+      minimumSdk: ANDROID_MIN_SDK,
+      targetSdk: ANDROID_TARGET_SDK,
+      language: "fr",
+    },
+    readiness: {
+      status: "foundation-ready",
+      readyForPrototype: true,
+      readyForProductionRelease: false,
+      summary:
+        "Le backend est exploitable pour une app Android prototype, mais il manque encore auth, push reel, billing et durcissement production pour une sortie Play Store propre.",
+      releaseBlockers: [
+        "Authentification utilisateur avec tokens/session",
+        "Notifications push reelles via Firebase Cloud Messaging",
+        "Verification serveur des abonnements Google Play",
+        "HTTPS, rotation des secrets et configuration production",
+      ],
+    },
+    backend: {
+      database: {
+        ok: Boolean(dbStatus?.ok),
+        mode: dbStatus?.mode || "unknown",
+      },
+      keyCapabilities: [
+        "matchs live et a venir",
+        "details match / prediction",
+        "generation et validation coupon",
+        "exports PNG/JPG/PDF",
+        "historique, favoris, watchlist synchronisable",
+        "chat IA unifie",
+      ],
+      liveTransport: "HTTP polling",
+      pwaBaseAlreadyPresent: true,
+    },
+    android: {
+      recommendedModules: [
+        "auth",
+        "matches",
+        "match-detail",
+        "coupon-builder",
+        "favorites-watchlist",
+        "chat",
+        "notifications",
+        "settings",
+      ],
+      persistence: [
+        "Room pour cache local",
+        "DataStore pour preferences",
+        "Retrofit/Ktor pour API",
+      ],
+    },
+    endpoints: {
+      bootstrap: "/api/mobile/bootstrap",
+      openapi: "/api/mobile/openapi",
+      health: "/health",
+      matchesUpcoming: "/api/matches/upcoming",
+      matchesLive: "/api/matches/live",
+      matchDetails: "/api/matches/:id/details",
+      prediction: "/api/predictions/:matchId",
+      couponGenerate: "/api/coupon/generate",
+      couponValidate: "/api/coupon/validate",
+      couponHistory: "/api/coupon/history",
+      favoritesList: "/api/coupon/favorites",
+      favoritesCreate: "/api/coupon/favorite",
+      watchlistGet: "/api/watchlist",
+      watchlistSave: "/api/watchlist",
+      deviceRegister: "/api/mobile/devices/register",
+      chat: "/api/chat",
+    },
+  };
 }
 
 function getClientKey(req) {
@@ -2348,7 +2459,7 @@ app.get("/api/predictions/top", async (_req, res) => {
 
 app.get("/api/predictions/:matchId", async (req, res) => {
   try {
-    const matchId = req.params.id;
+    const matchId = req.params.matchId;
     const details = await getMatchPredictionDetails(matchId);
     
     res.json({
@@ -2455,8 +2566,8 @@ app.get("/api/db/status", async (_req, res) => {
 });
 
 app.get("/api/coupon/favorites", async (req, res) => {
+  const userId = normalizeUserIdentifier(req.query.userId, "anonymous");
   try {
-    const userId = req.query.userId || "anonymous";
     const limit = Number(req.query.limit) || 20;
     
     const favorites = await getFavorites(userId, limit);
@@ -2684,14 +2795,17 @@ app.post("/api/coupon/favorite", async (req, res) => {
 });
 
 app.get("/api/watchlist", async (req, res) => {
+  const userId = normalizeUserIdentifier(req.query.userId, "default");
   try {
-    const userId = req.query.userId || "default";
+    const watchlistState = await getWatchlist(userId);
     res.json({
       success: true,
       data: {
-        watchlist: [],
-        total: 0,
-        userId: userId
+        watchlist: watchlistState.matchIds,
+        total: watchlistState.matchIds.length,
+        userId: watchlistState.userId,
+        snapshot: watchlistState.snapshot,
+        updatedAt: watchlistState.updatedAt
       },
       meta: {
         timestamp: new Date().toISOString()
@@ -2705,6 +2819,127 @@ app.get("/api/watchlist", async (req, res) => {
         message: "Impossible de recuperer la watchlist.",
         details: error.message
       }
+    });
+  }
+});
+
+app.post("/api/watchlist", async (req, res) => {
+  const userId = normalizeUserIdentifier(req.body?.userId, "default");
+  try {
+    const existing = await getWatchlist(userId);
+    let nextMatchIds = Array.isArray(req.body?.matchIds)
+      ? normalizeIdList(req.body.matchIds)
+      : existing.matchIds;
+
+    const addMatchId = trimText(req.body?.addMatchId, 80);
+    if (addMatchId) {
+      nextMatchIds = normalizeIdList([...nextMatchIds, addMatchId]);
+    }
+
+    const removeMatchId = trimText(req.body?.removeMatchId, 80);
+    if (removeMatchId) {
+      nextMatchIds = nextMatchIds.filter((matchId) => matchId !== removeMatchId);
+    }
+
+    const snapshot =
+      req.body?.snapshot && typeof req.body.snapshot === "object" && !Array.isArray(req.body.snapshot)
+        ? normalizePlainObject(req.body.snapshot)
+        : existing.snapshot;
+
+    const saved = await saveWatchlist({
+      userId,
+      matchIds: nextMatchIds,
+      snapshot,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        watchlist: saved.matchIds,
+        total: saved.matchIds.length,
+        userId: saved.userId,
+        snapshot: saved.snapshot,
+        updatedAt: saved.updatedAt,
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: "WATCHLIST_SAVE_ERROR",
+        message: "Impossible d'enregistrer la watchlist.",
+        details: error.message,
+      },
+    });
+  }
+});
+
+app.get("/api/mobile/bootstrap", async (_req, res) => {
+  try {
+    const dbStatus = await getDbStatus();
+    res.json({
+      success: true,
+      data: buildMobileBootstrapData(dbStatus),
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: "MOBILE_BOOTSTRAP_ERROR",
+        message: "Impossible de construire le bootstrap mobile.",
+        details: error.message,
+      },
+    });
+  }
+});
+
+app.get("/api/mobile/openapi", (_req, res) => {
+  res.sendFile(path.join(__dirname, "docs", "android-api.openapi.json"));
+});
+
+app.post("/api/mobile/devices/register", async (req, res) => {
+  try {
+    const deviceId = trimText(req.body?.deviceId, 255);
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: "MISSING_DEVICE_ID",
+          message: "deviceId requis.",
+        },
+      });
+    }
+
+    const record = await registerMobileDevice({
+      userId: req.body?.userId ? normalizeUserIdentifier(req.body.userId, "default") : null,
+      platform: trimText(req.body?.platform || "android", 40) || "android",
+      deviceId,
+      pushToken: trimText(req.body?.pushToken || req.body?.fcmToken, 2000) || null,
+      appVersion: trimText(req.body?.appVersion, 120) || null,
+      meta: normalizePlainObject(req.body?.meta),
+    });
+
+    return res.json({
+      success: true,
+      data: record,
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "MOBILE_DEVICE_REGISTER_ERROR",
+        message: "Impossible d'enregistrer l'appareil mobile.",
+        details: error.message,
+      },
     });
   }
 });
@@ -2843,30 +3078,41 @@ app.post("/api/coupon/generate", async (req, res) => {
   try {
     const { size = 3, league = "all", risk = "balanced", stake = 1000 } = req.body;
     const data = await getPenaltyMatches();
+    const nowSec = Math.floor(Date.now() / 1000);
     
     let matches = data.matches;
     if (league !== "all") {
-      matches = matches.filter(m => m.L === league || m.LE === league || m.LR === league);
+      matches = matches.filter((match) => String(match?.league || "") === String(league));
     }
     
-    const upcomingMatches = matches.filter(m => m.E === "UPCOMING" || m.E === "upcoming" || (!m.S1 && !m.S2));
+    const upcomingMatches = matches.filter((match) => {
+      const startTime = Number(match?.startTimeUnix) || 0;
+      const statusCode = Number(match?.statusCode);
+      const statusText = String(match?.statusText || "").toLowerCase();
+      const infoText = String(match?.infoText || "").toLowerCase();
+      return (
+        (startTime > nowSec && statusCode === 128) ||
+        statusText.includes("debut dans") ||
+        infoText.includes("avant le debut")
+      );
+    });
     const selectedMatches = upcomingMatches.slice(0, size);
     
     const couponId = `coupon_${Date.now()}`;
     const coupon = {
       id: couponId,
       matches: selectedMatches.map(match => ({
-        matchId: match.I,
-        homeTeam: match.O1,
-        awayTeam: match.O2,
-        league: match.L,
-        startTime: match.S,
-        odds: Array.isArray(match.E) ? match.E.find(e => e.G === 1)?.O : null,
+        matchId: String(match.id || ""),
+        homeTeam: match.teamHome,
+        awayTeam: match.teamAway,
+        league: match.league,
+        startTime: match.startTimeUnix,
+        odds: Number(match?.odds1x2?.home) || null,
         prediction: { recommendation: "1", confidence: 0.75 }
       })),
       config: { size, league, risk, stake },
       calculated: {
-        totalOdds: selectedMatches.reduce((acc, m) => acc * (Array.isArray(m.E) ? m.E.find(e => e.G === 1)?.O || 1.5 : 1.5), 1),
+        totalOdds: selectedMatches.reduce((acc, match) => acc * (Number(match?.odds1x2?.home) || 1.5), 1),
         potentialWin: 0
       },
       timestamp: new Date().toISOString()
